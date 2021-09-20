@@ -19,6 +19,10 @@ impl MessageBox {
     pub fn send<Msg: 'static>(&mut self, msg: Msg) {
         self.queue.push_back(Box::new(msg));
     }
+
+    pub fn send_boxed_ugly_needsfix(&mut self, msg: Box<dyn Any>) {
+        self.queue.push_back(msg);
+    }
 }
 
 /// Facade struct that contains a full, working actor system.
@@ -41,6 +45,7 @@ impl<'a, S:'static> ActorBuilder<'a, S> {
             Rc::new(move |state: &mut dyn Any, message: &dyn Any, outbox: &mut MessageBox| {
                 let state = state.downcast_mut::<S>().expect("Wrong state type!");
                 let message = message.downcast_ref::<M>().expect("Wrong message type!");
+
 
                 handler(state, message, outbox);
             })
@@ -81,7 +86,9 @@ impl System {
     ///
     /// Returns false if the internal queue was empty when calling the method.
     pub fn handle_one(&mut self) -> bool {
+
         if let Some(msg) = self.message_box.queue.pop_front() {
+
             if let Some(handlers) = self.handlers.get(&msg.deref().type_id()) {
                 for (state_key, handler) in handlers {
                     let state = self.state_store[*state_key].deref_mut();

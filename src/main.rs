@@ -9,10 +9,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use comparator::Comparator;
-use kiss3d::light::Light;
-use kiss3d::scene::SceneNode;
-use kiss3d::window::Window;
-use nalgebra::{Translation3, Vector3};
+use nalgebra::{Translation3, Vector3, distance};
 use nalgebra::Isometry3;
 use nalgebra::Point3;
 use rand::{Rng, thread_rng};
@@ -23,6 +20,10 @@ use slotmap::SlotMap;
 use typemap::TypeMap;
 
 use actors::System;
+use std::cell::RefCell;
+use blue_engine::header::{Engine, WindowDescriptor};
+use blue_engine::objects::triangle;
+use crate::actors::Fate::{Keep, End};
 
 mod actors;
 mod delay;
@@ -44,20 +45,14 @@ struct ScanPing(Point3<f64>);
 #[derive(Clone)]
 struct ScanPulse(Point3<f64>);
 
+const SCAN_PING_SPEED : f64 = 10.0;
+const SCAN_PING_RANGE : f64 = 1000.0;
 
 fn main() {
 
-    let mut window = Window::new("Kiss3d: cube");
-    window.set_background_color(0.0,0.0,0.0);
-
     let mut rng = thread_rng();
 
-    #[derive(Clone)]
-    struct ShipState {
-        position: Isometry3<f64>
-    }
-
-    struct ShipMoved(Isometry3<f64>);
+    struct ShipMoved(Point3<f64>);
 
     let asteroids = (0..10).map(|_| {
         Point3::new(
@@ -66,105 +61,189 @@ fn main() {
             rng.gen_range(-100.0 .. 100.0),
         )
     }).collect::<Vec<_>>();
-
-    for asteroid in &asteroids {
-        let mut s = window.add_sphere(0.5);
-        s.set_local_translation(Translation3::from(asteroid.coords.cast()));
-    }
-
-    let mut c = window.add_cube(1.0,1.0,1.0);
-
-    window.set_light(Light::StickToCamera);
+    //
+    // for asteroid in &asteroids {
+    //     let mut s = window.add_sphere(0.5);
+    //     s.set_local_translation(Translation3::from(asteroid.coords.cast()));
+    // }
 
     let mut system = System::new();
 
-    system.build_actor(ShipState {
-        position: Isometry3::identity()
+    struct ShipMovementController {
+        position: Point3<f64>,
+        destination: Option<Point3<f64>>
+    }
+
+    struct ShipDestination(Point3<f64>);
+    struct ShipArrived;
+
+    struct CollectAsteroid(Point3<f64>);
+
+    struct Score(u64);
+
+    system.build_actor(0)
+        .with_handler(move |score, _:&CollectAsteroid, outbox| {*score += 1; outbox.send(Score(*score)); Keep} );
+
+    system.build_actor(ShipMovementController {
+        position: Point3::origin(),
+        destination: None
     }).with_handler(move |state, _:&Tick, outbox| {
-        state.position.translation.y += 0.1;
-        outbox.send(ShipMoved(state.position.cast()));
+        if let Some(destination) = &state.destination {
+            const SPEED : f64 = 0.1;
+            if (destination - state.position).norm() < SPEED {
+                state.position = *destination;
+                state.destination = None;
+
+                outbox.send(ShipArrived);
+            } else {
+                state.position += (destination - state.position).normalize() * SPEED;
+            }
+        }
+        outbox.send(ShipMoved(state.position));
+
+        Keep
+    }).with_handler(move |state, ShipDestination(pos), outbox| {
+        state.destination = Some(*pos);
+
+        Keep
     });
 
-    system.build_actor(c)
-        .with_handler(move |sn, ShipMoved(pos), outbox| {
-        sn.set_local_transformation(pos.cast());
-    });
+    #[derive(PartialEq)]
+    enum ShipBehavior {
+        Ready,
+        WaitingForPing,
+        ApproachingAsteroid(Point3<f64>)
+    }
 
-    system.send(delay::delay_from_now(ScanPulse(Point3::new(0.0, 0.0, -100.0)), Duration::from_secs(5)));
+    struct ShipBehaviorControllerState {
+        position: Point3<f64>, // This shouldn't be in here.
+        behavior: ShipBehavior
+    }
+
+    #[derive(Clone)]
+    struct StartShip;
+
+    system.build_actor(ShipBehaviorControllerState {
+        behavior: ShipBehavior::Ready,
+        position: Point3::origin()
+    })
+        .with_handler(move |state, _:&StartShip, outbox| {
+            outbox.send(ScanPulse(state.position));
+            state.behavior = ShipBehavior::WaitingForPing;
+
+            Keep
+        })
+        .with_handler(move |state, ShipMoved(to), outbox| {
+            state.position = *to;
+
+            Keep
+        })
+        .with_handler(move |state, ScanPing(at), outbox| {
+            if state.behavior == ShipBehavior::WaitingForPing {
+                state.behavior = ShipBehavior::ApproachingAsteroid(* at);
+                outbox.send(ShipDestination(*at));
+            }
+
+            Keep
+        })
+        .with_handler(move |state, _:&ShipArrived, outbox| {
+            if let ShipBehavior::ApproachingAsteroid(pos) = &state.behavior {
+                outbox.send(CollectAsteroid(*pos));
+                state.behavior = ShipBehavior::Ready;
+
+                outbox.send(delay::delay_from_now(StartShip, Duration::from_secs(5)));
+            }
+
+            Keep
+        });
+
+    system.send(delay::delay_from_now(StartShip, Duration::from_secs(5)));
 
     for pt in asteroids.iter().cloned() {
         system.build_actor(())
             .with_handler(move |sn, ScanPulse(pos), outbox| {
-                outbox.send(delay::delay_from_now(ScanPing(pt), Duration::from_secs_f64((pos - pt).norm())));
+                outbox.send(delay::delay_from_now(ScanPing(pt), Duration::from_secs_f64((pos - pt).norm() / SCAN_PING_SPEED)));
+                Keep
+            })
+            .with_handler(move |score, CollectAsteroid(pt), outbox| {
+                End
             });
     }
 
-    let mut sn = SceneNode::new_empty();
-    window.scene_mut().add_child(sn.clone());
-
-    system.build_actor(())
-        .with_handler(|_,ScanPulse(origin),outbox| outbox.send(ExpandingSphereEffect(origin.clone())))
-        .with_handler(|_,ScanPing(origin),outbox| outbox.send(ExpandingSphereEffect(origin.clone())));
-
-    init_scan_pulse_visualizer(&mut system, sn);
-
+    // let mut sn = SceneNode::new_empty();
+    // window.scene_mut().add_child(sn.clone());
+    //
+    // system.build_actor(())
+    //     .with_handler(|_,ScanPulse(origin),outbox| outbox.send(ExpandingSphereEffect(origin.clone())))
+    //     .with_handler(|_,ScanPing(origin),outbox| outbox.send(ExpandingSphereEffect(origin.clone())));
+    //
+    // init_scan_pulse_visualizer(&mut system, sn);
 
     delay::init_delay_handler(&mut system);
 
-    while window.render() {
+    system.build_actor(())
+        .with_handler(move |_,_:&ScanPulse,_| {println!("Scan pulse"); Keep})
+        .with_handler(move |_,_:&ScanPing,_| {println!("Scan ping"); Keep})
+        .with_handler(move |_,_:&ShipDestination,_| {println!("Ship moving to destination"); Keep} )
+        .with_handler(move |_,_:&ShipArrived,_| {println!("Scan arrived"); Keep} )
+        .with_handler(move |_,_:&CollectAsteroid,_| {println!("Asteroid collected"); Keep} )
+        .with_handler(move |_,Score(score),_| {println!("Score: {}", score); Keep} );
+
+    loop {
         system.send(Tick);
-        while system.handle_one() {};
+        while system.handle_one() {}
+        sleep(Duration::from_millis(10));
     }
 }
-
-
-
-#[derive(Clone)]
-struct ExpandingSphere {
-    sn: SceneNode,
-    time: Instant
-}
-
-#[derive(Clone)]
-struct ScanPulses {
-    pulses: Vec<ExpandingSphere>,
-    parent_sn: SceneNode
-}
-
-#[derive(Clone)]
-struct ExpandingSphereEffect(Point3<f64>);
-
-fn init_scan_pulse_visualizer(system: &mut System, mut sn: SceneNode) {
-    system.build_actor(ScanPulses {
-        pulses: Vec::new(),
-        parent_sn: sn
-    })
-        .with_handler(move |st, ExpandingSphereEffect(pos), outbox| {
-            let mut node = st.parent_sn.add_sphere(0.0);
-            node.set_local_translation(pos.cast().into());
-            node.set_color(0.0, 1.0, 1.0);
-            st.pulses.push(ExpandingSphere {
-                sn: node,
-                time: Instant::now()
-            })
-        })
-        .with_handler(move |st, _: &Tick, outbox| {
-            st.pulses.retain_mut(|es| {
-                let age = Instant::now().duration_since(es.time);
-
-                let age_t = age.as_secs_f64() / 2.0;
-
-                if age_t >= 1.0 {
-                    es.sn.unlink();
-                    false
-                } else {
-                    es.sn.set_local_scale(
-                        (age_t * 100.0) as f32,
-                        (age_t * 100.0) as f32,
-                        (age_t * 100.0) as f32
-                    );
-                    true
-                }
-            });
-        });
-}
+//
+// #[derive(Clone)]
+// struct ExpandingSphere {
+//     // sn: SceneNode,
+//     time: Instant
+// }
+//
+// #[derive(Clone)]
+// struct ScanPulses {
+//     pulses: Vec<ExpandingSphere>,
+//     parent_sn: SceneNode
+// }
+//
+// #[derive(Clone)]
+// struct ExpandingSphereEffect(Point3<f64>);
+//
+// fn init_scan_pulse_visualizer(system: &mut System, mut sn: SceneNode) {
+//
+//     system.build_actor(ScanPulses {
+//         pulses: Vec::new(),
+//         parent_sn: sn
+//     })
+//         .with_handler(move |st, ExpandingSphereEffect(pos), outbox| {
+//             let mut node = st.parent_sn.add_sphere(0.0);
+//             node.set_local_translation(pos.cast().into());
+//             node.set_color(0.0, 1.0, 1.0);
+//
+//             st.pulses.push(ExpandingSphere {
+//                 sn: node,
+//                 time: Instant::now()
+//             })
+//         })
+//         .with_handler(move |st, _: &Tick, outbox| {
+//             st.pulses.retain_mut(|es| {
+//                 let age = Instant::now().duration_since(es.time);
+//
+//                 let age_t = age.as_secs_f64();
+//
+//                 if age_t >= SCAN_PING_RANGE / SCAN_PING_SPEED {
+//                     es.sn.unlink();
+//                     false
+//                 } else {
+//                     es.sn.set_local_scale(
+//                         (age_t * SCAN_PING_SPEED) as f32,
+//                         (age_t * SCAN_PING_SPEED) as f32,
+//                         (age_t * SCAN_PING_SPEED) as f32
+//                     );
+//                     true
+//                 }
+//             });
+//         });
+// }

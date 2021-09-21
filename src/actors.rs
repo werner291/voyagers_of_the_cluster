@@ -5,6 +5,7 @@ use std::rc::Rc;
 use slotmap::new_key_type;
 use slotmap::SlotMap;
 use std::marker::PhantomData;
+use crate::actors::Fate::{End, Keep};
 
 /// Internal type referring to an entry in the SlotMap of actor states.
 new_key_type! { pub struct StateKey; }
@@ -28,7 +29,7 @@ impl MessageBox {
 /// Facade struct that contains a full, working actor system.
 pub struct System {
     state_store: SlotMap<StateKey, Box<dyn Any>>,
-    handlers: HashMap<TypeId, Vec<(StateKey, Rc<dyn Fn(&mut dyn Any, &dyn Any, &mut MessageBox)>)>>,
+    handlers: HashMap<TypeId, Vec<(StateKey, Rc<dyn Fn(&mut dyn Any, &dyn Any, &mut MessageBox) -> Fate>)>>,
     message_box: MessageBox,
 }
 
@@ -38,8 +39,13 @@ pub struct ActorBuilder<'a, S:'static> {
     phantom: PhantomData<S>
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum Fate {
+    Keep, End
+}
+
 impl<'a, S:'static> ActorBuilder<'a, S> {
-    pub fn with_handler<M: 'static, F: Fn(&mut S, &M, &mut MessageBox) + 'static>(mut self, handler: F) -> Self {
+    pub fn with_handler<M: 'static, F: Fn(&mut S, &M, &mut MessageBox) -> Fate + 'static>(mut self, handler: F) -> Self {
         self.system.handlers.entry(TypeId::of::<M>()).or_default().push((
             self.state_key,
             Rc::new(move |state: &mut dyn Any, message: &dyn Any, outbox: &mut MessageBox| {
@@ -47,7 +53,7 @@ impl<'a, S:'static> ActorBuilder<'a, S> {
                 let message = message.downcast_ref::<M>().expect("Wrong message type!");
 
 
-                handler(state, message, outbox);
+                handler(state, message, outbox)
             })
         ));
 
@@ -89,10 +95,18 @@ impl System {
 
         if let Some(msg) = self.message_box.queue.pop_front() {
 
-            if let Some(handlers) = self.handlers.get(&msg.deref().type_id()) {
-                for (state_key, handler) in handlers {
-                    let state = self.state_store[*state_key].deref_mut();
-                    handler(state, &*msg, &mut self.message_box);
+            if let Some(handlers) = self.handlers.get_mut(&msg.deref().type_id()) {
+
+                let state_store = &mut self.state_store;
+                let message_box = &mut self.message_box;
+
+                handlers.retain(|(state_key, handler)| {
+                    let state = state_store[*state_key].deref_mut();
+                    handler(state, &*msg, message_box) == Keep
+                });
+
+                if self.handlers[&msg.deref().type_id()].is_empty() {
+                    self.handlers.remove(&msg.deref().type_id());
                 }
             }
 
@@ -107,6 +121,7 @@ impl System {
 mod tests {
     use std::sync::mpsc::channel;
     use super::*;
+    use crate::actors::Fate::Keep;
 
     #[test]
     fn hello_world() {
@@ -121,11 +136,15 @@ mod tests {
                 *i += 1;
 
                 outbox.send(*i);
+
+                Keep
             });
 
         system.build_actor(tx)
             .with_handler(|tx, i: &i32, outbox| {
                 tx.send(*i).unwrap();
+
+                Keep
             });
 
         system.send(Tick);

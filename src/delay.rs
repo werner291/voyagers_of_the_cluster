@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::actors::System;
 use crate::Tick;
+use crate::actors::Fate::Keep;
 
 pub fn delay_from_now<T:Any+'static+Clone>(ping: T, delay: Duration) -> DelayUntil {
     DelayUntil(Instant::now() + delay, Box::new(move || Box::new(ping.clone())))
@@ -11,9 +12,10 @@ pub fn delay_from_now<T:Any+'static+Clone>(ping: T, delay: Duration) -> DelayUnt
 pub struct DelayUntil(Instant, Box<dyn Fn() -> Box<dyn Any>>);
 
 pub fn init_delay_handler(system: &mut System) {
-    system.build_actor(comparator::collections::BinaryHeap::with_comparator(|a: &(Instant, Box<dyn Any>), b: &(Instant, Box<dyn Any>)| a.0.partial_cmp(&b.0).unwrap())
+    system.build_actor(comparator::collections::BinaryHeap::with_comparator(|a: &(Instant, Box<dyn Any>), b: &(Instant, Box<dyn Any>)| b.0.partial_cmp(&a.0).unwrap())
     ).with_handler(|st, msg: &DelayUntil, _| {
         st.push((msg.0, msg.1()));
+        Keep
     }).with_handler(|st, _: &Tick, outbox| {
         while let Some(head) = st.peek() {
             if head.0 < Instant::now() {
@@ -23,6 +25,7 @@ pub fn init_delay_handler(system: &mut System) {
                 break;
             }
         }
+        Keep
     });
 }
 

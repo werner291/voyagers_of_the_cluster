@@ -61,11 +61,6 @@ fn main() {
             rng.gen_range(-100.0 .. 100.0),
         )
     }).collect::<Vec<_>>();
-    //
-    // for asteroid in &asteroids {
-    //     let mut s = window.add_sphere(0.5);
-    //     s.set_local_translation(Translation3::from(asteroid.coords.cast()));
-    // }
 
     let mut system = System::new();
 

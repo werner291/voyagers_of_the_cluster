@@ -9,7 +9,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use comparator::Comparator;
-use nalgebra::{Translation3, Vector3, distance};
+use nalgebra::{Translation3, Vector3, distance, Quaternion, UnitQuaternion};
 use nalgebra::Isometry3;
 use nalgebra::Point3;
 use rand::{Rng, thread_rng};
@@ -24,6 +24,9 @@ use std::cell::RefCell;
 use blue_engine::header::{Engine, WindowDescriptor};
 use blue_engine::objects::triangle;
 use crate::actors::Fate::{Keep, End};
+use kiss3d::window::Window;
+use std::path::Path;
+use kiss3d::nalgebra::base::storage::Storage;
 
 mod actors;
 mod delay;
@@ -69,9 +72,11 @@ fn main() {
         destination: Option<Point3<f64>>
     }
 
+    #[derive(Debug)]
     struct ShipDestination(Point3<f64>);
     struct ShipArrived;
 
+    #[derive(Debug)]
     struct CollectAsteroid(Point3<f64>);
 
     struct Score(u64);
@@ -98,6 +103,7 @@ fn main() {
 
         Keep
     }).with_handler(move |state, ShipDestination(pos), outbox| {
+        eprintln!("Will go to destination: {:?}", pos.coords.data.as_slice());
         state.destination = Some(*pos);
 
         Keep
@@ -136,7 +142,10 @@ fn main() {
         .with_handler(move |state, ScanPing(at), outbox| {
             if state.behavior == ShipBehavior::WaitingForPing {
                 state.behavior = ShipBehavior::ApproachingAsteroid(* at);
-                outbox.send(ShipDestination(*at));
+
+                let delta = at - state.position;
+
+                outbox.send(ShipDestination(at - delta.normalize() * 1.0));
             }
 
             Keep
@@ -158,10 +167,17 @@ fn main() {
         system.build_actor(())
             .with_handler(move |sn, ScanPulse(pos), outbox| {
                 outbox.send(delay::delay_from_now(ScanPing(pt), Duration::from_secs_f64((pos - pt).norm() / SCAN_PING_SPEED)));
+                eprintln!("Asteroid {:?} echoing: ", pt.coords.data.as_slice());
                 Keep
             })
-            .with_handler(move |score, CollectAsteroid(pt), outbox| {
-                End
+            .with_handler(move |score, CollectAsteroid(collected_pt), outbox| {
+                if collected_pt == &pt {
+                    eprintln!("Asteroid {:?} can't be pinged.", pt.coords.data.as_slice());
+                    End
+                } else {
+                    eprintln!("Asteroid {:?} can still be pinged", pt.coords.data.as_slice());
+                    Keep
+                }
             });
     }
 
@@ -181,10 +197,42 @@ fn main() {
         .with_handler(move |_,_:&ScanPing,_| {println!("Scan ping"); Keep})
         .with_handler(move |_,_:&ShipDestination,_| {println!("Ship moving to destination"); Keep} )
         .with_handler(move |_,_:&ShipArrived,_| {println!("Scan arrived"); Keep} )
-        .with_handler(move |_,_:&CollectAsteroid,_| {println!("Asteroid collected"); Keep} )
+        .with_handler(move |_,c:&CollectAsteroid,_| {println!("Asteroid collected: {:#?}",c); Keep} )
         .with_handler(move |_,Score(score),_| {println!("Score: {}", score); Keep} );
 
-    loop {
+    let mut window = Window::new("Kiss3d: cube");
+
+    let mut miner = window.add_obj(Path::new("models/miner.obj"), Path::new("models"), Vector3::new(1.0,1.0,1.0));
+
+    system.build_actor(miner).with_handler(|sn,ShipMoved(to),_| {
+        sn.set_local_translation(to.coords.cast().into());
+        Keep
+    });
+
+    let mut ringstation = window.add_obj(Path::new("models/ringstation.obj"), Path::new("models"), Vector3::new(1.0,1.0,1.0));
+
+    system.build_actor(ringstation).with_handler(move |sn,_:&Tick,_| {
+
+        sn.append_rotation(&UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 0.01));
+
+        Keep
+    });
+
+    for roid in asteroids {
+        let mut ball = window.add_sphere(1.0);
+        ball.set_local_translation(roid.coords.cast().into());
+
+        system.build_actor(ball).with_handler(move |ball,CollectAsteroid(the_roid),_| {
+            if &roid == the_roid {
+                ball.unlink();
+                End
+            } else {
+                Keep
+            }
+        });
+    }
+
+    while window.render() {
         system.send(Tick);
         while system.handle_one() {}
         sleep(Duration::from_millis(10));

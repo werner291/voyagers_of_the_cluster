@@ -9,6 +9,7 @@ use crate::actors::Fate::{End, Keep};
 
 /// Internal type referring to an entry in the SlotMap of actor states.
 new_key_type! { pub struct StateKey; }
+new_key_type! { pub struct HandlerKey; }
 
 /// Struct that new messages can be placed into for later processing
 pub struct MessageBox {
@@ -26,10 +27,15 @@ impl MessageBox {
     }
 }
 
+struct RunningActor {
+    state: Box<dyn Any>,
+    handlers: Vec<(TypeId,HandlerKey)>
+}
+
 /// Facade struct that contains a full, working actor system.
 pub struct System {
-    state_store: SlotMap<StateKey, Box<dyn Any>>,
-    handlers: HashMap<TypeId, Vec<(StateKey, Rc<dyn Fn(&mut dyn Any, &dyn Any, &mut MessageBox) -> Fate>)>>,
+    state_store: SlotMap<StateKey, RunningActor>,
+    handlers: HashMap<TypeId, SlotMap<HandlerKey, (StateKey, Rc<dyn Fn(&mut dyn Any, &dyn Any, &mut MessageBox) -> Fate>)>>,
     message_box: MessageBox,
 }
 
@@ -46,7 +52,8 @@ pub enum Fate {
 
 impl<'a, S:'static> ActorBuilder<'a, S> {
     pub fn with_handler<M: 'static, F: Fn(&mut S, &M, &mut MessageBox) -> Fate + 'static>(mut self, handler: F) -> Self {
-        self.system.handlers.entry(TypeId::of::<M>()).or_default().push((
+
+        let handler_key = self.system.handlers.entry(TypeId::of::<M>()).or_default().insert((
             self.state_key,
             Rc::new(move |state: &mut dyn Any, message: &dyn Any, outbox: &mut MessageBox| {
                 let state = state.downcast_mut::<S>().expect("Wrong state type!");
@@ -56,6 +63,8 @@ impl<'a, S:'static> ActorBuilder<'a, S> {
                 handler(state, message, outbox)
             })
         ));
+
+        self.system.state_store[self.state_key].handlers.push((TypeId::of::<M>(), handler_key));
 
         self
     }
@@ -74,12 +83,15 @@ impl System {
         }
     }
     pub fn build_actor<S: 'static>(&mut self, initial_state: S) -> ActorBuilder<S> {
-        let state_key = self.state_store.insert(Box::new(initial_state));
+        let state_key = self.state_store.insert(RunningActor{
+            state: Box::new(initial_state),
+            handlers: vec![]
+        });
 
         ActorBuilder {
             system: self,
             state_key,
-            phantom: PhantomData::default()
+            phantom: PhantomData::default(),
         }
     }
 
@@ -100,13 +112,23 @@ impl System {
                 let state_store = &mut self.state_store;
                 let message_box = &mut self.message_box;
 
-                handlers.retain(|(state_key, handler)| {
-                    let state = state_store[*state_key].deref_mut();
-                    handler(state, &*msg, message_box) == Keep
-                });
+                let mut dead_actors = vec![];
 
-                if self.handlers[&msg.deref().type_id()].is_empty() {
-                    self.handlers.remove(&msg.deref().type_id());
+                for (_, (state_key,handler)) in handlers {
+                    let state = state_store[*state_key].state.deref_mut();
+                    if handler(state, &*msg, message_box) == End {
+                        dead_actors.push(*state_key);
+                    }
+                }
+
+                for state_key in dead_actors {
+                    let corpse = self.state_store.remove(state_key).expect("Zombie handler.");
+                    for (typ, hkey) in corpse.handlers {
+                        self.handlers.get_mut(&typ).expect("Invalid handler reference in state store.").remove(hkey);
+                        if self.handlers[&typ].is_empty() {
+                            self.handlers.remove(&typ);
+                        }
+                    }
                 }
             }
 

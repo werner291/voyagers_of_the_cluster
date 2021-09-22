@@ -37,6 +37,7 @@ mod tests {
     use std::sync::mpsc::channel;
     use std::thread::sleep;
     use crate::Tick;
+    use crate::actors::Fate::Keep;
 
     #[test]
     fn test_delay() {
@@ -52,6 +53,7 @@ mod tests {
 
         system.build_actor(()).with_handler(move |_,_:&Ping,_| {
             tx.send(Instant::now());
+            Keep
         });
 
         let start = Instant::now();

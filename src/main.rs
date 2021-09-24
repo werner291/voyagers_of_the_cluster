@@ -3,7 +3,7 @@ use std::borrow::BorrowMut;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::marker::PhantomData;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -22,9 +22,14 @@ use typemap::TypeMap;
 use actors::System;
 use std::cell::RefCell;
 use crate::actors::Fate::{Keep, End};
-use kiss3d::window::Window;
+use kiss3d::window::{Window, Canvas};
 use std::path::Path;
 use kiss3d::nalgebra::base::storage::Storage;
+use kiss3d::camera::{Camera, ArcBall};
+use kiss3d::event::{WindowEvent, Key, Action};
+use kiss3d::nalgebra::Matrix4;
+use kiss3d::resource::ShaderUniform;
+use kiss3d::scene::SceneNode;
 
 mod actors;
 mod delay;
@@ -43,11 +48,28 @@ struct Tick;
 
 #[derive(Clone)]
 struct ScanPing(Point3<f64>);
+
+impl Interpretable for ScanPing {
+    fn interpret(&self) -> String {
+        format!("A scanner pulse bounced off something at {}", self.0)
+    }
+}
+
 #[derive(Clone)]
 struct ScanPulse(Point3<f64>);
 
+impl Interpretable for ScanPulse {
+    fn interpret(&self) -> String {
+        format!("A scanner pulse went off at {}", self.0)
+    }
+}
+
 const SCAN_PING_SPEED : f64 = 10.0;
 const SCAN_PING_RANGE : f64 = 1000.0;
+
+trait Interpretable {
+    fn interpret(&self) -> String;
+}
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
 struct ShipId(u64);
@@ -55,17 +77,47 @@ struct ShipId(u64);
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct ShipDestination(ShipId,Point3<f64>);
 
+impl Interpretable for ShipDestination {
+    fn interpret(&self) -> String {
+        format!("Ship {:?} will travel to destination {}", self.0, self.1)
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
 struct ShipArrived(ShipId);
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-struct ShipMoved(ShipId,Point3<f64>);
+impl Interpretable for ShipArrived {
+    fn interpret(&self) -> String {
+        format!("Ship {:?} has arrived at its planned destination.", self.0)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-struct CollectAsteroid(Point3<f64>);
+struct ShipMoved(ShipId,Isometry3<f64>);
+
+impl Interpretable for ShipMoved {
+    fn interpret(&self) -> String {
+        format!("Ship {:?} has moved to position {}", self.0, self.1)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct AsteroidCollected(Point3<f64>);
+
+impl Interpretable for AsteroidCollected {
+    fn interpret(&self) -> String {
+        format!("Asteroid at {} has been collected.", self.0)
+    }
+}
 
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
-struct Score(u64);
+struct ScoreChangedTo(u64);
+
+impl Interpretable for ScoreChangedTo {
+    fn interpret(&self) -> String {
+        format!("The score has been changed to {} points.", self.0)
+    }
+}
 
 fn main() {
 
@@ -73,7 +125,7 @@ fn main() {
 
     let mut rng = thread_rng();
 
-    let mut window = Window::new("Kiss3d: cube");
+    let mut window = Window::new_with_size("Kiss3d: cube", 1000,800);
 
     let asteroids = (0..10).map(|_| {
         Point3::new(
@@ -118,7 +170,7 @@ fn main() {
                     state.position += (destination - state.position).normalize() * SPEED;
                 }
             }
-            outbox.send(ShipMoved(ship_id, state.position));
+            outbox.send(ShipMoved(ship_id, Isometry3::translation(state.position.x,state.position.y,state.position.z)));
 
             Keep
         }).with_handler(move |state, ShipDestination(id, pos), outbox| {
@@ -156,7 +208,7 @@ fn main() {
             })
             .with_handler(move |state, ShipMoved(id, to), outbox| {
                 if *id == state.ship_id {
-                    state.position = *to;
+                    state.position = to.translation.vector.into();
                 }
 
                 Keep
@@ -175,7 +227,7 @@ fn main() {
             .with_handler(move |state, ShipArrived(id), outbox| {
                 if *id == state.ship_id {
                     if let ShipBehavior::ApproachingAsteroid(pos) = &state.behavior {
-                        outbox.send(CollectAsteroid(*pos));
+                        outbox.send(AsteroidCollected(*pos));
                         state.behavior = ShipBehavior::Ready;
 
                         outbox.send(delay::delay_from_now(StartShip(ship_id), Duration::from_secs(5)));
@@ -188,15 +240,20 @@ fn main() {
         let mut miner = window.add_obj(Path::new("models/miner.obj"), Path::new("models"), Vector3::new(1.0,1.0,1.0));
 
         system.build_actor(miner).with_handler(move |sn,ShipMoved(id, to),_| {
-            if *id == ship_id { sn.set_local_translation(to.coords.cast().into()) };
+            if *id == ship_id { sn.set_local_transformation(to.cast())};
             Keep
         });
+
+
 
         system.send(delay::delay_from_now(StartShip(ship_id), Duration::from_secs(5)));
     }
 
+    let mut fighter = window.add_obj(Path::new("models/fighter.obj"), Path::new("models"), Vector3::new(1.0,1.0,1.0));
+    fighter.set_local_translation(Translation3::new(0.0,5.0,10.0));
+
     system.build_actor(0)
-        .with_handler(move |score, _:&CollectAsteroid, outbox| {*score += 1; outbox.send(Score(*score)); Keep} );
+        .with_handler(move |score, _:&AsteroidCollected, outbox| {*score += 1; outbox.send(ScoreChangedTo(*score)); Keep} );
 
     for pt in asteroids.iter().cloned() {
         system.build_actor(())
@@ -204,7 +261,7 @@ fn main() {
                 outbox.send(delay::delay_from_now(ScanPing(pt), Duration::from_secs_f64((pos - pt).norm() / SCAN_PING_SPEED)));
                 Keep
             })
-            .with_handler(move |score, CollectAsteroid(collected_pt), outbox| {
+            .with_handler(move |score, AsteroidCollected(collected_pt), outbox| {
                 if collected_pt == &pt {
                     End
                 } else {
@@ -225,16 +282,12 @@ fn main() {
     delay::init_delay_handler(&mut system);
 
     system.build_actor(())
-        .with_handler(move |_,_:&ScanPulse,_| {println!("Scan pulse"); Keep})
-        .with_handler(move |_,_:&ScanPing,_| {println!("Scan ping"); Keep})
-        .with_handler(move |_,_:&ShipDestination,_| {println!("Ship moving to destination"); Keep} )
-        .with_handler(move |_,_:&ShipArrived,_| {println!("Scan arrived"); Keep} )
-        .with_handler(move |_,c:&CollectAsteroid,_| {println!("Asteroid collected: {:#?}",c); Keep} )
-        .with_handler(move |_,Score(score),_| {println!("Score: {}", score); Keep} );
-
-
-
-
+        .with_handler(move |_,evt:&ScanPulse,_| {println!("{}", evt.interpret()); Keep})
+        // .with_handler(move |_,evt:&ScanPing,_|          {println!("{}", evt.interpret()); Keep})
+        .with_handler(move |_,evt:&ShipDestination,_|   {println!("{}", evt.interpret()); Keep})
+        .with_handler(move |_,evt:&ShipArrived,_|       {println!("{}", evt.interpret()); Keep})
+        .with_handler(move |_,evt:&AsteroidCollected, _| {println!("{}", evt.interpret()); Keep})
+        .with_handler(move |_,evt:&ScoreChangedTo, _|   {println!("{}", evt.interpret()); Keep});
 
     let mut ringstation = window.add_obj(Path::new("models/ringstation.obj"), Path::new("models"), Vector3::new(1.0,1.0,1.0));
 
@@ -249,7 +302,7 @@ fn main() {
         let mut ball = window.add_sphere(1.0);
         ball.set_local_translation(roid.coords.cast().into());
 
-        system.build_actor(ball).with_handler(move |ball,CollectAsteroid(the_roid),_| {
+        system.build_actor(ball).with_handler(move |ball, AsteroidCollected(the_roid), _| {
             if &roid == the_roid {
                 ball.unlink();
                 println!("Roidn't");
@@ -260,7 +313,107 @@ fn main() {
         });
     }
 
-    while window.render() {
+    let mut camera = kiss3d::camera::ArcBall::new(Point3::new(1.0,1.0,1.0), Point3::new(0.0,5.0,10.0));
+
+    struct KeyState(Key, Action);
+
+    let fighter_ship_id = ShipId(555);
+
+    let mut camera = Rc::new(RefCell::new(camera));
+
+    let mut camera_2 = camera.clone();
+
+    system.build_actor(Isometry3::identity())
+        .with_handler(move |xfm,KeyState(key,action),outbox| {
+            match key {
+                Key::Space => if *action == Action::Press { *xfm *= &Translation3::new(0.0, 0.0, -1.0); },
+                Key::A => if *action == Action::Press { *xfm *= &UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 0.01); },
+                Key::D => if *action == Action::Press { *xfm *= &UnitQuaternion::from_axis_angle(&Vector3::z_axis(), -0.01); },
+                Key::W => if *action == Action::Press { *xfm *= &UnitQuaternion::from_axis_angle(&Vector3::x_axis(), 0.01); },
+                Key::S => if *action == Action::Press { *xfm *= &UnitQuaternion::from_axis_angle(&Vector3::x_axis(), -0.01); },
+                Key::Q => if *action == Action::Press { *xfm *= &UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 0.01); },
+                Key::E => if *action == Action::Press { *xfm *= &UnitQuaternion::from_axis_angle(&Vector3::y_axis(), -0.01); },
+                _ => {}
+            }
+
+            outbox.send(ShipMoved(fighter_ship_id, xfm.clone()));
+
+            Keep
+        });
+
+    system.build_actor(fighter)
+        .with_handler(move |sn, ShipMoved(id, at), outbox| {
+            if *id == fighter_ship_id {
+                sn.set_local_transformation(at.cast());
+            }
+            Keep
+        });
+
+    system.build_actor(camera.clone())
+        .with_handler(move |cam,ShipMoved(id,at),outbox| {
+
+            if *id == fighter_ship_id {
+                let eye: Point3<f32> = (*camera_2).borrow().eye();
+                let focus: Point3<f32> = at.translation.vector.cast().into();
+
+                let new_eye_tgt: Point3<f32> = focus + (eye - focus).normalize() * 20.0;
+
+                let new_eye: Point3<f32> = eye + (new_eye_tgt - eye) * 0.01;
+
+                (*camera_2).borrow_mut().look_at(new_eye, focus);
+            }
+            Keep
+        });
+
+    let mut radar_sn = SceneNode::new_empty();
+
+    window.scene_mut().add_child(radar_sn.clone());
+
+    struct TrackerVizState {
+        positions: HashMap<ShipId, (SceneNode, Point3<f64>)>,
+        sn: SceneNode
+    }
+
+    system.build_actor(TrackerVizState {
+        positions: Default::default(),
+        sn: radar_sn,
+    })
+        .with_handler(move |st,ShipMoved(id,at),outbox| {
+
+            if *id != fighter_ship_id {
+                if st.positions.contains_key(id) {
+                    st.positions.get_mut(id).unwrap().1 = at.translation.vector.into();
+                } else {
+                    st.positions.insert(*id, ({
+                                                  let mut sn = st.sn.add_sphere(0.1);
+                        sn.set_color(0.0,1.0,1.0);
+                        sn
+                                              }, at.translation.vector.into()));
+                }
+            } else {
+                st.sn.set_local_translation(at.translation.cast());
+            }
+
+            Keep
+        }).with_handler(move |st,_:&Tick,_| {
+
+            let base_frame : Point3<f32> = st.sn.data().local_translation().vector.into();
+
+            for (_,(sn,pos)) in st.positions.iter_mut() {
+                sn.set_local_translation(
+                    ((pos.cast()-base_frame).normalize() * 10.0).into()
+                )
+            }
+
+        Keep
+    });
+
+    while window.render_with_camera((*camera).borrow_mut().deref_mut()) {
+
+        for key in &[Key::Space,Key::Q,Key::W,Key::E,Key::A,Key::S,Key::D] {
+            system.send(KeyState(*key, window.get_key(*key)));
+        }
+
         system.send(Tick);
         while system.handle_one() {}
         sleep(Duration::from_millis(10));
